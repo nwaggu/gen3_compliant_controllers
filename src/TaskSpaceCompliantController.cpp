@@ -235,11 +235,13 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
   //           << std::endl;
   mLastTimePoint = std::chrono::high_resolution_clock::now();
 
+  //Get current data
   mJointStateUpdater->update();
   mCurrentPosition = mJointStateUpdater->mCurrentPosition;
   mCurrentVelocity = mJointStateUpdater->mCurrentVelocity;
   mCurrentEffort = mJointStateUpdater->mCurrentEffort;
 
+  //Very first command bring everything to a stop!
   if (mExecuteDefaultCommand.load())
   {
     mDesiredPosition = mCurrentPosition;
@@ -270,7 +272,7 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
       tmp.col(1) = -tmp.col(1);
     }
   }
-
+  //Setup initializations
   if (!mExtendedJoints->mIsInitialized)
   {
     mLastDesiredPosition = mDesiredPosition;

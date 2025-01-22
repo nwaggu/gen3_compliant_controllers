@@ -186,6 +186,7 @@ namespace combined_controller_ns{
   
   void update (const ros::Time& time, const ros::Duration& period){
     
+    
   }
   
   
