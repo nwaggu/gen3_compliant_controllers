@@ -275,12 +275,17 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
   //Setup initializations
   if (!mExtendedJoints->mIsInitialized)
   {
+    //Sets Last Desired From Desired
     mLastDesiredPosition = mDesiredPosition;
+    //Identical to EE Transform
     mLastDesiredEETransform = mDesiredEETransform;
+    //intialize ExtendedJoints (sensor reading smoother?)
     mExtendedJoints->initializeExtendedJointPosition(mDesiredPosition);
     mExtendedJoints->estimateExtendedJoint(mDesiredPosition);
+    //Nominal Q
     mNominalThetaPrev = mExtendedJoints->getExtendedJoint();
     mNominalThetaDotPrev = mCurrentVelocity;
+    //Desired  Positions? 
     mTrueDesiredPosition = mExtendedJoints->getExtendedJoint();
     mTrueDesiredVelocity = mDesiredVelocity;
     mTrueDesiredEETransform = mDesiredEETransform;
@@ -336,9 +341,11 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
   Eigen::VectorXd dart_error(6);
   Eigen::MatrixXd dart_nominal_jacobian(6, mNumControlledDofs);
   {
+    //Convert EE to Quanterion? 
     Eigen::Quaterniond ee_quat_d(mTrueDesiredEETransform.linear());
 
     Eigen::VectorXd q_pin_nominal_prev = joint_ros_to_pinocchio(mNominalThetaPrev, *mModel);
+    //Compute the Jacobian for that timestep (geometric)
     pinocchio::computeJointJacobians(*mModel, *mData, q_pin_nominal_prev);
     pinocchio::updateFramePlacement(*mModel, *mData, mEENode);
     mNominalEETransform = mData->oMf[mEENode].toHomogeneousMatrix_impl();
@@ -349,9 +356,12 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
 
     Eigen::Quaterniond nominal_ee_quat(mNominalEETransform.linear());
 
+    //Gets the Jacobian and stores it in dart_nominal_jacobian
     pinocchio::getFrameJacobian(*mModel, *mData, mEENode, pinocchio::LOCAL_WORLD_ALIGNED, dart_nominal_jacobian);
+    //Place positional error in dart_error
     dart_error.head(3) << mNominalEETransform.translation() - mTrueDesiredEETransform.translation(); // positional error
 
+    //?????
     if (ee_quat_d.coeffs().dot(nominal_ee_quat.coeffs()) < 0.0)
     {
       nominal_ee_quat.coeffs() << -nominal_ee_quat.coeffs();
@@ -378,6 +388,7 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
 
   mCommandEffort = mTaskEffort + mNominalFriction;
 
+  //Forced period of rest?
   if (mCount < 50)
   {
     mCommandEffort = Eigen::VectorXd::Zero(mNumControlledDofs);
@@ -386,6 +397,7 @@ void TaskSpaceCompliantController::update(const ros::Time& time, const ros::Dura
       std::cout << "Initializing controller: " << mCount << std::endl;
   }
 
+  //Send the commands!!
   for (size_t idof = 0; idof < mControlledJointHandles.size(); ++idof)
   {
     auto jointHandle = mControlledJointHandles[idof];

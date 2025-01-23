@@ -184,18 +184,187 @@ namespace combined_controller_ns{
   return true;
 }
   
-  void update (const ros::Time& time, const ros::Duration& period){
-    
-    
+
+
+void CombinedController::update(const ros::Time& time, const ros::Duration& period)
+{
+
+  auto current_time = std::chrono::high_resolution_clock::now();
+  auto duration = duration_cast<microseconds>(current_time - mLastTimePoint);
+
+  // std::cout << "Controller Frequency: " << 1000000.0 / duration.count()
+  //           << std::endl;
+  mLastTimePoint = std::chrono::high_resolution_clock::now();
+
+  //Get current data
+  mJointStateUpdater->update();
+  mCurrentPosition = mJointStateUpdater->mCurrentPosition;
+  mCurrentVelocity = mJointStateUpdater->mCurrentVelocity;
+  mCurrentEffort = mJointStateUpdater->mCurrentEffort;
+
+  //Very first command bring everything to a stop!
+  if (mExecuteDefaultCommand.load())
+  {
+    mDesiredPosition = mCurrentPosition;
+    mDesiredVelocity.setZero();
+    Eigen::VectorXd q_pin_desired = joint_ros_to_pinocchio(mDesiredPosition, *mModel);
+    pinocchio::forwardKinematics(*mModel, *mData, q_pin_desired, mZeros);
+    pinocchio::updateFramePlacement(*mModel, *mData, mEENode);
+    mDesiredEETransform = mData->oMf[mEENode].toHomogeneousMatrix_impl();
+    auto tmp = mDesiredEETransform.linear();
+    // make first and second column negative to account for axis convention
+    tmp.col(0) = -tmp.col(0);
+    tmp.col(1) = -tmp.col(1);
+    mExecuteDefaultCommand = false;
   }
-  
-  
-  
-  
-  
-  
-  
-  };
+  else
+  {
+    moveit_msgs::CartesianTrajectoryPoint& command = *mCommandsBuffer.readFromRT();
+    if (command.point.pose.position.x == 0.0 && command.point.pose.position.y == 0.0 && command.point.pose.position.z == 0.0)
+    {
+      ROS_WARN_STREAM_NAMED(mName, "Received command with zero position, skipping.");
+    }
+    else
+    {
+      geometry_msgs::Pose command_pose = command.point.pose;
+      tf::poseMsgToEigen(command_pose, mDesiredEETransform);
+      auto tmp = mDesiredEETransform.linear();
+      tmp.col(0) = -tmp.col(0);
+      tmp.col(1) = -tmp.col(1);
+    }
+  }
+  //Setup initializations
+  if (!mExtendedJoints->mIsInitialized)
+  {
+    //Sets Last Desired From Desired
+    mLastDesiredPosition = mDesiredPosition;
+    //Identical to EE Transform
+    mLastDesiredEETransform = mDesiredEETransform;
+    //intialize ExtendedJoints (sensor reading smoother?)
+    mExtendedJoints->initializeExtendedJointPosition(mDesiredPosition);
+    mExtendedJoints->estimateExtendedJoint(mDesiredPosition);
+    //Nominal Q
+    mNominalThetaPrev = mExtendedJoints->getExtendedJoint();
+    mNominalThetaDotPrev = mCurrentVelocity;
+    //Desired  Positions? 
+    mTrueDesiredPosition = mExtendedJoints->getExtendedJoint();
+    mTrueDesiredVelocity = mDesiredVelocity;
+    mTrueDesiredEETransform = mDesiredEETransform;
+  }
+
+  if (mDesiredPosition != mLastDesiredPosition || !mDesiredEETransform.isApprox(mLastDesiredEETransform, 0.0001) && mCurrentPosition != mDesiredPosition)
+  {
+    mLastDesiredPosition = mDesiredPosition;
+    mLastDesiredEETransform = mDesiredEETransform;
+    mTrueDesiredPosition = mExtendedJoints->getExtendedJoint();
+    mTrueDesiredVelocity = mDesiredVelocity;
+    mTrueDesiredEETransform = mDesiredEETransform;
+  }
+
+  {
+    mExtendedJointsGravity->mIsInitialized = false;
+    mExtendedJointsGravity->initializeExtendedJointPosition(mDesiredPosition);
+    mExtendedJointsGravity->estimateExtendedJoint(mExtendedJointsGravity->mLastDesiredPosition);
+    mCurrentTheta = mExtendedJointsGravity->getExtendedJoint();
+
+    mGravity = pinocchio::computeGeneralizedGravity(*mModel, *mData, joint_ros_to_pinocchio(mCurrentTheta, *mModel));
+
+    // compute quasi-static estimate of the link side position
+    // input value is motor side angle theta not link side angle(q);
+    // Number of iteration can be modified by editing i (recommend is 1 or 2
+    // for real-time computing)
+    // NOTE: currently not being used
+
+    // int iteration = 1; // number of iteration
+    // Eigen::VectorXd qs_estimate_link_pos(numControlledDofs);
+    // qs_estimate_link_pos = mNominalThetaPrev;
+
+    // for (int i=0; i<iteration; i++)
+    // {
+    // 	Eigen::VectorXd q_pin = joint_ros_to_pinocchio(qs_estimate_link_pos,
+    // *mModel); 	mGravity = pinocchio::computeGeneralizedGravity(*mModel,
+    // *mData, q_pin);
+    //     qs_estimate_link_pos = mNominalThetaPrev -
+    //     mJointStiffnessMatrix.inverse()*mGravity;
+    // }
+    // Eigen::VectorXd q_pin = joint_ros_to_pinocchio(qs_estimate_link_pos,
+    // *mModel); mQuasiGravity = pinocchio::computeGeneralizedGravity(*mModel,
+    // *mData, q_pin);
+  }
+
+  mExtendedJoints->estimateExtendedJoint(mCurrentPosition);
+  mCurrentTheta = mExtendedJoints->getExtendedJoint();
+
+  mDesiredTheta = mTrueDesiredPosition + mJointStiffnessMatrix.inverse() * mGravity;
+  mDesiredThetaDot = mTrueDesiredVelocity;
+
+  // Compute error
+  Eigen::VectorXd dart_error(6);
+  Eigen::MatrixXd dart_nominal_jacobian(6, mNumControlledDofs);
+  {
+    //Convert EE to Quanterion? 
+    Eigen::Quaterniond ee_quat_d(mTrueDesiredEETransform.linear());
+
+    Eigen::VectorXd q_pin_nominal_prev = joint_ros_to_pinocchio(mNominalThetaPrev, *mModel);
+    //Compute the Jacobian for that timestep (geometric)
+    pinocchio::computeJointJacobians(*mModel, *mData, q_pin_nominal_prev);
+    pinocchio::updateFramePlacement(*mModel, *mData, mEENode);
+    mNominalEETransform = mData->oMf[mEENode].toHomogeneousMatrix_impl();
+    auto tmp2 = mNominalEETransform.linear();
+    // make first and second column negative to account for axis convention
+    tmp2.col(0) = -tmp2.col(0);
+    tmp2.col(1) = -tmp2.col(1);
+
+    Eigen::Quaterniond nominal_ee_quat(mNominalEETransform.linear());
+
+    //Gets the Jacobian and stores it in dart_nominal_jacobian
+    pinocchio::getFrameJacobian(*mModel, *mData, mEENode, pinocchio::LOCAL_WORLD_ALIGNED, dart_nominal_jacobian);
+    //Place positional error in dart_error
+    dart_error.head(3) << mNominalEETransform.translation() - mTrueDesiredEETransform.translation(); // positional error
+
+    //?????
+    if (ee_quat_d.coeffs().dot(nominal_ee_quat.coeffs()) < 0.0)
+    {
+      nominal_ee_quat.coeffs() << -nominal_ee_quat.coeffs();
+    }
+
+    Eigen::Quaterniond error_qtn(nominal_ee_quat.inverse() * ee_quat_d);
+    dart_error.tail(3) << error_qtn.x(), error_qtn.y(), error_qtn.z();
+    dart_error.tail(3) << -mNominalEETransform.linear() * dart_error.tail(3);
+  }
+
+  mTaskEffort = dart_nominal_jacobian.transpose() * (-mTaskKMatrix * dart_error - mTaskDMatrix * (dart_nominal_jacobian * mNominalThetaDotPrev));
+
+  double step_time;
+  step_time = 0.001;
+
+  mNominalThetaDDot = mRotorInertiaMatrix.inverse() * (mTaskEffort + mGravity + mCurrentEffort); // mCurrentEffort is negative of what is required here
+  mNominalThetaDot = mNominalThetaDotPrev + mNominalThetaDDot * step_time;
+  mNominalTheta = mNominalThetaPrev + mNominalThetaDot * step_time;
+
+  mNominalThetaPrev = mNominalTheta;
+  mNominalThetaDotPrev = mNominalThetaDot;
+
+  mNominalFriction = mRotorInertiaMatrix * mFrictionL * ((mNominalThetaDotPrev - mCurrentVelocity) + mFrictionLp * (mNominalThetaPrev - mCurrentTheta));
+
+  mCommandEffort = mTaskEffort + mNominalFriction;
+
+  //Forced period of rest?
+  if (mCount < 50)
+  {
+    mCommandEffort = Eigen::VectorXd::Zero(mNumControlledDofs);
+    mCount++;
+    if (mCount % 10 == 0)
+      std::cout << "Initializing controller: " << mCount << std::endl;
+  }
+
+  //Send the commands!!
+  for (size_t idof = 0; idof < mControlledJointHandles.size(); ++idof)
+  {
+    auto jointHandle = mControlledJointHandles[idof];
+    jointHandle.setCommand(mCommandEffort[idof]);
+  }
+}
 
 }
 
